@@ -44,6 +44,45 @@ def load_vendor_summary(data: bytes):
     return list(csv.DictReader(StringIO(data.decode('utf-8'))))
 
 
+def load_detention(data: bytes):
+    """Load all sheets from detention file, combine into one list indexed by LR number."""
+    wb = load_workbook(BytesIO(data), data_only=True)
+    all_rows = []
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+        # Find header row containing LR
+        header_idx = None
+        for i, row in enumerate(rows):
+            if any(cell and 'lr' in str(cell).lower() for cell in row):
+                header_idx = i
+                break
+        if header_idx is None:
+            continue
+        headers = [str(h).strip().lower() if h is not None else '' for h in rows[header_idx]]
+        # Find LR column index
+        lr_col = next((i for i, h in enumerate(headers)
+                       if h in ('lr n.', 'lr no', 'lr no.', 'lr n', 'lr number', 'lr n. ')), None)
+        # Find amount column index (unloading/amount)
+        amt_col = next((i for i, h in enumerate(headers)
+                        if any(k in h for k in ('unlod', 'unload', 'amount'))), None)
+        if lr_col is None:
+            continue
+        for row in rows[header_idx + 1:]:
+            lr_val = row[lr_col] if lr_col < len(row) else None
+            amt_val = row[amt_col] if amt_col is not None and amt_col < len(row) else None
+            if lr_val is None or str(lr_val).strip() == '':
+                continue
+            all_rows.append({
+                'sheet': sheet_name,
+                'lr_number': str(lr_val).strip(),
+                'detention_unload_amount': amt_val,
+            })
+    return all_rows
+
+
 # -------- helpers --------
 
 def is_empty(v):
@@ -201,62 +240,136 @@ def reconcile(rel_rows, bill_rows, vendor_rows):
     return results
 
 
+# -------- detention reconcile (LR-driven) --------
+
+def reconcile_detention(bill_rows, detention_rows):
+    """Match billing LR No. with detention LR number, compare Unload charges."""
+    # Index detention by LR number (normalized)
+    det_index = {}
+    for row in detention_rows:
+        lr = norm_str(row.get('lr_number'))
+        if lr:
+            det_index.setdefault(lr, []).append(row)
+
+    results = []
+    for b in bill_rows:
+        lr = norm_str(b.get('LR No.'))
+        billing_unload = norm_num(b.get('Unload charges'))
+        entry = {
+            'LR No': b.get('LR No.'),
+            'SO Number': b.get('SO Number'),
+            'TCN/Trip': b.get('TCN/Trip Number'),
+            'Billing Unload Amt': billing_unload,
+            'Detention Unload Amt': '',
+            'Detention Sheet': '',
+        }
+
+        if not lr or lr not in det_index:
+            entry['Result'] = '❌ LR NOT IN DETENTION'
+            entry['Diff'] = ''
+            results.append(entry)
+            continue
+
+        det_row = det_index[lr][0]
+        det_amt = norm_num(det_row.get('detention_unload_amount'))
+        entry['Detention Unload Amt'] = det_amt
+        entry['Detention Sheet'] = det_row.get('sheet', '')
+
+        if billing_unload is not None and det_amt is not None and abs(billing_unload - det_amt) < 0.01:
+            entry['Result'] = '✅ MATCHED'
+            entry['Diff'] = 0
+        else:
+            entry['Result'] = '⚠️ MISMATCH'
+            entry['Diff'] = (billing_unload or 0) - (det_amt or 0)
+        results.append(entry)
+    return results
+
+
 # -------- UI --------
 
 st.title("📋 Trivedi ↔ Reliance Reconciliation")
-st.caption("Billing Annexure ki TCN/Trip Number Reliance me dhundhi jayegi. Phir TMS status check, phir field-by-field compare. Reliance ke empty fields Vendor Summary se fill honge.")
 
-c1, c2, c3 = st.columns(3)
+# File uploaders
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     bill_file = st.file_uploader("Billing Portal (.xlsx)", type=['xlsx'], key='bill')
 with c2:
     rel_file = st.file_uploader("Reliance Portal (.xlsx)", type=['xlsx'], key='rel')
 with c3:
     vendor_file = st.file_uploader("Vendor Summary (.csv) — optional", type=['csv'], key='vendor')
+with c4:
+    detention_file = st.file_uploader("Detention Sheet (.xlsx) — optional", type=['xlsx'], key='detention')
 
 if rel_file and bill_file:
     if st.button("🔍 Reconcile", type='primary'):
         try:
-            bill_rows = load_billing(bill_file.read())
+            bill_bytes = bill_file.read()
+            bill_rows = load_billing(bill_bytes)
             rel_rows = load_reliance(rel_file.read())
             vendor_rows = load_vendor_summary(vendor_file.read()) if vendor_file else None
+            detention_rows = load_detention(detention_file.read()) if detention_file else None
 
             msg = f"Loaded: {len(bill_rows)} Billing | {len(rel_rows)} Reliance"
-            if vendor_rows is not None:
+            if vendor_rows:
                 msg += f" | {len(vendor_rows)} Vendor Summary"
+            if detention_rows is not None:
+                msg += f" | {len(detention_rows)} Detention rows"
             st.success(msg)
 
-            results = reconcile(rel_rows, bill_rows, vendor_rows)
-            df = pd.DataFrame(results)
+            # ---- Tabs ----
+            tab1, tab2 = st.tabs(["📊 Reliance Reconciliation", "🚛 Detention LR Check"])
 
-            counts = df['Result'].value_counts().to_dict()
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("✅ Matched", counts.get('✅ MATCHED', 0))
-            m2.metric("⚠️ Mismatch", counts.get('⚠️ MISMATCH', 0))
-            m3.metric("🚫 Rejected", counts.get('🚫 REJECTED', 0))
-            m4.metric("❌ Not in Reliance", counts.get('❌ NOT IN RELIANCE', 0))
+            with tab1:
+                results = reconcile(rel_rows, bill_rows, vendor_rows)
+                df = pd.DataFrame(results)
 
-            if vendor_rows is not None:
-                fb_count = df['Fallback Used'].astype(bool).sum()
-                st.info(f"🔁 Vendor Summary fallback used in **{fb_count}** rows")
+                counts = df['Result'].value_counts().to_dict()
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("✅ Matched", counts.get('✅ MATCHED', 0))
+                m2.metric("⚠️ Mismatch", counts.get('⚠️ MISMATCH', 0))
+                m3.metric("🚫 Rejected", counts.get('🚫 REJECTED', 0))
+                m4.metric("❌ Not in Reliance", counts.get('❌ NOT IN RELIANCE', 0))
 
-            filter_opt = st.multiselect(
-                "Filter by result",
-                options=df['Result'].unique().tolist(),
-                default=df['Result'].unique().tolist(),
-            )
-            view = df[df['Result'].isin(filter_opt)]
-            st.dataframe(view, use_container_width=True, hide_index=True)
+                if vendor_rows:
+                    fb_count = df['Fallback Used'].astype(bool).sum()
+                    st.info(f"🔁 Vendor Summary fallback used in **{fb_count}** rows")
 
-            csv_bytes = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "⬇️ Download Results (CSV)",
-                csv_bytes,
-                file_name="reconciliation_result.csv",
-                mime="text/csv",
-            )
+                filter_opt = st.multiselect(
+                    "Filter by result",
+                    options=df['Result'].unique().tolist(),
+                    default=df['Result'].unique().tolist(),
+                    key='filter1'
+                )
+                st.dataframe(df[df['Result'].isin(filter_opt)], use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Download (CSV)", df.to_csv(index=False).encode(),
+                                   "reconciliation_result.csv", "text/csv")
+
+            with tab2:
+                if detention_rows is None:
+                    st.info("👆 Detention Sheet upload karo (4th uploader).")
+                else:
+                    det_results = reconcile_detention(bill_rows, detention_rows)
+                    ddf = pd.DataFrame(det_results)
+
+                    dc1, dc2, dc3 = st.columns(3)
+                    dcounts = ddf['Result'].value_counts().to_dict()
+                    dc1.metric("✅ Matched", dcounts.get('✅ MATCHED', 0))
+                    dc2.metric("⚠️ Mismatch", dcounts.get('⚠️ MISMATCH', 0))
+                    dc3.metric("❌ LR Not Found", dcounts.get('❌ LR NOT IN DETENTION', 0))
+
+                    filter_opt2 = st.multiselect(
+                        "Filter by result",
+                        options=ddf['Result'].unique().tolist(),
+                        default=ddf['Result'].unique().tolist(),
+                        key='filter2'
+                    )
+                    st.dataframe(ddf[ddf['Result'].isin(filter_opt2)], use_container_width=True, hide_index=True)
+                    st.download_button("⬇️ Download Detention Results (CSV)",
+                                       ddf.to_csv(index=False).encode(),
+                                       "detention_result.csv", "text/csv")
+
         except Exception as e:
             st.error(f"Error: {e}")
             st.exception(e)
 else:
-    st.info("👆 Billing + Reliance files upload karo (Vendor Summary optional).")
+    st.info("👆 Billing + Reliance files upload karo.")
