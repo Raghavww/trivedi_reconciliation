@@ -225,6 +225,15 @@ def load_detention(data):
     return all_rows
 
 
+def load_rate_list(data):
+    wb = load_workbook(BytesIO(data), data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows: return []
+    headers = [str(h).strip() if h else '' for h in rows[0]]
+    return [dict(zip(headers, r)) for r in rows[1:] if any(c not in (None,'') for c in r)]
+
+
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def is_empty(v): return v is None or (isinstance(v, str) and v.strip() == '')
@@ -363,6 +372,50 @@ def reconcile_detention(bill_rows, det_rows):
     return results
 
 
+# ─── Rate list check ───────────────────────────────────────────────────────────
+
+def build_rate_index(rate_rows):
+    """Index rate list by pincode (each pincode in comma-separated cell → row)."""
+    idx = {}  # pincode -> list of rate rows
+    for r in rate_rows:
+        pin_cell = str(r.get('PIN CODE') or '').strip()
+        if not pin_cell or pin_cell == '#N/A':
+            continue
+        for p in pin_cell.split(','):
+            p = p.strip()
+            if p:
+                idx.setdefault(p, []).append(r)
+    return idx
+
+def check_rate(bill_row, rate_idx):
+    """For a billing row, find matching rate list entry and compare freight."""
+    pincode   = str(bill_row.get('Pin code') or '').strip()
+    src       = norm_str(bill_row.get('Supplying City'))
+    dest      = norm_str(bill_row.get('Receiving Stop City'))
+    freight   = norm_num(bill_row.get('Frieght as per Emptoris Contract'))
+
+    if not pincode or pincode not in rate_idx:
+        return '❌ PINCODE NOT FOUND', None, None, ''
+
+    # Among rows matching pincode, find one where source+dest also match
+    candidates = rate_idx[pincode]
+    matched_row = None
+    for r in candidates:
+        if norm_str(r.get('Source')) == src and norm_str(r.get('Destination')) == dest:
+            matched_row = r
+            break
+
+    if matched_row is None:
+        return '❌ SRC/DEST NOT MATCHED', None, None, ''
+
+    rate = norm_num(matched_row.get('Rate'))
+    if freight is not None and rate is not None and abs(freight - rate) < 0.01:
+        return '✅ RATE MATCHED', freight, rate, ''
+    else:
+        diff = (freight or 0) - (rate or 0)
+        return '⚠️ RATE MISMATCH', freight, rate, diff
+
+
 # ─── UI helpers ────────────────────────────────────────────────────────────────
 
 def metric_card(num, label, kind):
@@ -395,7 +448,8 @@ def render_table(df, key_prefix):
         if '❌' in str(val):  return 'background-color:#F8FAFC; color:#475569; font-weight:600'
         return ''
 
-    styled = view.style.map(color_result, subset=['Result'])
+    style_cols = [c for c in ['Result', 'Rate Status'] if c in view.columns]
+    styled = view.style.map(color_result, subset=style_cols)
     st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(f"Showing {len(view)} of {len(df)} rows")
     return view
@@ -420,7 +474,7 @@ st.markdown("""
 
 # ── File uploaders ──
 st.markdown('<div class="section-heading">Upload Files</div>', unsafe_allow_html=True)
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 
 with c1:
     st.markdown('<div class="upload-label">Billing Portal<span class="upload-badge">XLSX · Required</span></div>', unsafe_allow_html=True)
@@ -437,6 +491,10 @@ with c3:
 with c4:
     st.markdown('<div class="upload-label">Detention Sheet<span class="upload-badge">XLSX · Optional</span></div>', unsafe_allow_html=True)
     detention_file = st.file_uploader("", type=['xlsx'], key='detention', label_visibility='collapsed')
+
+with c5:
+    st.markdown('<div class="upload-label">Rate List<span class="upload-badge">XLSX · Optional</span></div>', unsafe_allow_html=True)
+    rate_file = st.file_uploader("", type=['xlsx'], key='rate', label_visibility='collapsed')
 
 # Clear all button
 cl1, cl2 = st.columns([1,5])
@@ -456,21 +514,49 @@ if rel_file and bill_file:
                 rel_rows     = load_reliance(rel_file.read())
                 vendor_rows  = load_vendor_summary(vendor_file.read()) if vendor_file else None
                 det_rows     = load_detention(detention_file.read()) if detention_file else None
+                rate_rows    = load_rate_list(rate_file.read()) if rate_file else None
 
                 msg = f"✅  Loaded — {len(bill_rows)} Billing · {len(rel_rows)} Reliance"
                 if vendor_rows: msg += f" · {len(vendor_rows)} Vendor"
                 if det_rows:    msg += f" · {len(det_rows)} Detention rows"
+                if rate_rows:   msg += f" · {len(rate_rows)} Rate rows"
 
                 results = reconcile(rel_rows, bill_rows, vendor_rows)
+                df = pd.DataFrame(results)
+
+                # Integrate rate list check into main results
+                if rate_rows:
+                    rate_idx = build_rate_index(rate_rows)
+                    # Build billing index by TCN for fast lookup
+                    bill_by_tcn = {str(b.get('TCN/Trip Number','')).strip().upper(): b
+                                   for b in bill_rows}
+                    rate_status, bill_freights, rate_freights, rate_diffs = [], [], [], []
+                    for _, row in df.iterrows():
+                        tcn = str(row.get('TCN/Trip','')).strip().upper()
+                        b   = bill_by_tcn.get(tcn)
+                        if b:
+                            rs, bf, rf, rd = check_rate(b, rate_idx)
+                        else:
+                            rs, bf, rf, rd = '—', None, None, ''
+                        rate_status.append(rs)
+                        bill_freights.append(bf)
+                        rate_freights.append(rf)
+                        rate_diffs.append(rd)
+                    df['Rate Status']     = rate_status
+                    df['Billing Freight'] = bill_freights
+                    df['Rate List Rate']  = rate_freights
+                    df['Rate Diff']       = rate_diffs
+
                 det_results = reconcile_detention(bill_rows, det_rows) if det_rows else None
 
                 # Save to session state
-                st.session_state['results_df']  = pd.DataFrame(results)
+                st.session_state['results_df']  = df
                 st.session_state['det_df']       = pd.DataFrame(det_results) if det_results else None
                 st.session_state['loaded_msg']   = msg
                 st.session_state['has_vendor']   = vendor_rows is not None
-                st.session_state['vendor_fb']    = pd.DataFrame(results)['Fallback Used'].astype(bool).sum() if vendor_rows else 0
+                st.session_state['vendor_fb']    = df['Fallback Used'].astype(bool).sum() if vendor_rows else 0
                 st.session_state['has_det']      = det_rows is not None
+                st.session_state['has_rate']     = rate_rows is not None
 
             except Exception as e:
                 st.error(f"Error: {e}")
