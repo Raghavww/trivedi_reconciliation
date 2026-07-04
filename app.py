@@ -403,6 +403,11 @@ def render_table(df, key_prefix):
 
 # ─── PAGE ──────────────────────────────────────────────────────────────────────
 
+# ─── Session state init ────────────────────────────────────────────────────────
+for _k in ['results_df','det_df','loaded_msg']:
+    if _k not in st.session_state:
+        st.session_state[_k] = None
+
 st.markdown("""
 <div class="header-banner">
     <div class="header-icon">🚛</div>
@@ -433,6 +438,14 @@ with c4:
     st.markdown('<div class="upload-label">Detention Sheet<span class="upload-badge">XLSX · Optional</span></div>', unsafe_allow_html=True)
     detention_file = st.file_uploader("", type=['xlsx'], key='detention', label_visibility='collapsed')
 
+# Clear all button
+cl1, cl2 = st.columns([1,5])
+with cl1:
+    if st.button("🗑️ Clear All Data"):
+        for _k in ['results_df','det_df','loaded_msg']:
+            st.session_state[_k] = None
+        st.rerun()
+
 st.write("")
 
 if rel_file and bill_file:
@@ -447,61 +460,68 @@ if rel_file and bill_file:
                 msg = f"✅  Loaded — {len(bill_rows)} Billing · {len(rel_rows)} Reliance"
                 if vendor_rows: msg += f" · {len(vendor_rows)} Vendor"
                 if det_rows:    msg += f" · {len(det_rows)} Detention rows"
-                st.success(msg)
 
-                tab1, tab2 = st.tabs(["📊  Reliance Reconciliation", "🚛  Detention LR Check"])
+                results = reconcile(rel_rows, bill_rows, vendor_rows)
+                det_results = reconcile_detention(bill_rows, det_rows) if det_rows else None
 
-                # ── Tab 1 ──────────────────────────────────────────────────────
-                with tab1:
-                    results = reconcile(rel_rows, bill_rows, vendor_rows)
-                    df = pd.DataFrame(results)
-                    counts = df['Result'].value_counts().to_dict()
-
-                    st.markdown('<div class="metric-row">', unsafe_allow_html=True)
-                    mc1,mc2,mc3,mc4 = st.columns(4)
-                    with mc1: metric_card(counts.get('✅ MATCHED',0),      "Matched",         "green")
-                    with mc2: metric_card(counts.get('⚠️ MISMATCH',0),    "Mismatch",        "amber")
-                    with mc3: metric_card(counts.get('🚫 REJECTED',0),    "Rejected",        "red")
-                    with mc4: metric_card(counts.get('❌ NOT IN RELIANCE',0),"Not in Reliance","slate")
-                    st.markdown('</div>', unsafe_allow_html=True)
-
-                    if vendor_rows:
-                        fb = df['Fallback Used'].astype(bool).sum()
-                        st.info(f"🔁 Vendor Summary fallback used in **{fb}** rows")
-
-                    st.markdown('<div class="section-heading">Results</div>', unsafe_allow_html=True)
-                    view = render_table(df, 'tab1')
-                    st.download_button("⬇️  Download CSV", df.to_csv(index=False).encode(),
-                                       "reconciliation_result.csv", "text/csv")
-
-                # ── Tab 2 ──────────────────────────────────────────────────────
-                with tab2:
-                    if det_rows is None:
-                        st.markdown("""
-                        <div class="empty-state">
-                            <div class="empty-state-icon">📂</div>
-                            <div class="empty-state-text">Detention Sheet nahi mila</div>
-                            <div class="empty-state-sub">4th uploader me Detention XLSX upload karo aur dobara Reconcile karo</div>
-                        </div>""", unsafe_allow_html=True)
-                    else:
-                        det_results = reconcile_detention(bill_rows, det_rows)
-                        ddf = pd.DataFrame(det_results)
-                        dcounts = ddf['Result'].value_counts().to_dict()
-
-                        dc1,dc2,dc3 = st.columns(3)
-                        with dc1: metric_card(dcounts.get('✅ MATCHED',0),           "LR Matched",   "green")
-                        with dc2: metric_card(dcounts.get('⚠️ MISMATCH',0),         "Amount Diff",  "amber")
-                        with dc3: metric_card(dcounts.get('❌ LR NOT IN DETENTION',0),"LR Not Found", "slate")
-
-                        st.markdown('<div class="section-heading">Detention Results</div>', unsafe_allow_html=True)
-                        render_table(ddf, 'tab2')
-                        st.download_button("⬇️  Download Detention CSV",
-                                           ddf.to_csv(index=False).encode(),
-                                           "detention_result.csv", "text/csv")
+                # Save to session state
+                st.session_state['results_df']  = pd.DataFrame(results)
+                st.session_state['det_df']       = pd.DataFrame(det_results) if det_results else None
+                st.session_state['loaded_msg']   = msg
+                st.session_state['has_vendor']   = vendor_rows is not None
+                st.session_state['vendor_fb']    = pd.DataFrame(results)['Fallback Used'].astype(bool).sum() if vendor_rows else 0
+                st.session_state['has_det']      = det_rows is not None
 
             except Exception as e:
                 st.error(f"Error: {e}")
                 st.exception(e)
+
+# ── Show results from session state (persists across reruns) ──
+if st.session_state['results_df'] is not None:
+    df  = st.session_state['results_df']
+    ddf = st.session_state['det_df']
+
+    st.success(st.session_state['loaded_msg'])
+    tab1, tab2 = st.tabs(["📊  Reliance Reconciliation", "🚛  Detention LR Check"])
+
+    # ── Tab 1 ────────────────────────────────────────────────────────
+    with tab1:
+        counts = df['Result'].value_counts().to_dict()
+        mc1,mc2,mc3,mc4 = st.columns(4)
+        with mc1: metric_card(counts.get('✅ MATCHED',0),        "Matched",          "green")
+        with mc2: metric_card(counts.get('⚠️ MISMATCH',0),      "Mismatch",         "amber")
+        with mc3: metric_card(counts.get('🚫 REJECTED',0),      "Rejected",         "red")
+        with mc4: metric_card(counts.get('❌ NOT IN RELIANCE',0),"Not in Reliance",  "slate")
+
+        if st.session_state.get('has_vendor'):
+            st.info(f"🔁 Vendor Summary fallback used in **{st.session_state['vendor_fb']}** rows")
+
+        st.markdown('<div class="section-heading">Results</div>', unsafe_allow_html=True)
+        render_table(df, 'tab1')
+        st.download_button("⬇️  Download CSV", df.to_csv(index=False).encode(),
+                           "reconciliation_result.csv", "text/csv")
+
+    # ── Tab 2 ────────────────────────────────────────────────────────
+    with tab2:
+        if ddf is None:
+            st.markdown("""
+            <div class="empty-state">
+                <div class="empty-state-icon">📂</div>
+                <div class="empty-state-text">Detention Sheet nahi mila</div>
+                <div class="empty-state-sub">4th uploader me Detention XLSX upload karo aur dobara Reconcile karo</div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            dcounts = ddf['Result'].value_counts().to_dict()
+            dc1,dc2,dc3 = st.columns(3)
+            with dc1: metric_card(dcounts.get('✅ MATCHED',0),            "LR Matched",   "green")
+            with dc2: metric_card(dcounts.get('⚠️ MISMATCH',0),          "Amount Diff",  "amber")
+            with dc3: metric_card(dcounts.get('❌ LR NOT IN DETENTION',0),"LR Not Found", "slate")
+
+            st.markdown('<div class="section-heading">Detention Results</div>', unsafe_allow_html=True)
+            render_table(ddf, 'tab2')
+            st.download_button("⬇️  Download Detention CSV",
+                               ddf.to_csv(index=False).encode(),
+                               "detention_result.csv", "text/csv")
 else:
     st.markdown("""
     <div class="empty-state">
