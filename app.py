@@ -395,7 +395,7 @@ def render_table(df, key_prefix):
         if '❌' in str(val):  return 'background-color:#F8FAFC; color:#475569; font-weight:600'
         return ''
 
-    styled = view.style.applymap(color_result, subset=['Result'])
+    styled = view.style.map(color_result, subset=['Result'])
     st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(f"Showing {len(view)} of {len(df)} rows")
     return view
